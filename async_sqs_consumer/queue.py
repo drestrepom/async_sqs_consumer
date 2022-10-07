@@ -8,9 +8,7 @@ from async_sqs_consumer.resources import (
 from async_sqs_consumer.utils.retry import (
     retry,
 )
-from asyncio import (
-    TimeoutError,
-)
+import asyncio
 from botocore.exceptions import (
     ClientError,
 )
@@ -22,7 +20,7 @@ NETWORK_ERRORS = (
     ServerDisconnectedError,
     ClientConnectorError,
     ClientError,
-    TimeoutError,
+    asyncio.TimeoutError,
 )
 
 
@@ -38,7 +36,9 @@ async def get_queue_messages(queue_url: str) -> list[dict[str, Any]]:
 
 
 @retry(exceptions=NETWORK_ERRORS, tries=3, delay=0.2)
-async def delete_messages(queue_url: str, receipt_handle: dict[str, Any]) -> None:
+async def delete_messages(
+    queue_url: str, receipt_handle: dict[str, Any]
+) -> None:
     client = await get_sqs_client()
     await client.delete_message(
         ReceiptHandle=receipt_handle,

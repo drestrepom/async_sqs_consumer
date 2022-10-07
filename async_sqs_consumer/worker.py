@@ -25,6 +25,8 @@ import signal
 import sys
 from typing import (
     Any,
+    Callable,
+    Literal,
     Optional,
 )
 
@@ -37,9 +39,10 @@ class Worker:
     def __init__(self, queue_url: str) -> None:
         self.queue_url = queue_url
         self.running = False
-        self.handlers = {}
+        self.handlers: dict[str, Callable[..., Any]] = {}
+        self._events: dict[str, list[Callable[[], None]]]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._main_task = None
+        self._main_task: Optional[asyncio.Task] = None
 
     def _sigint_handler(self, *_args: Any) -> None:
         sys.stdout.write("\b\b\r")
@@ -55,16 +58,30 @@ class Worker:
         )
         self._stop_worker()
 
-    def _stop_worker(self, *_) -> None:
-        self._loop.create_task(sqs_shutdown())
-        LOGGER.debug("Stop worker")
-        self.running = False
+    def _stop_worker(self, *_: Any) -> None:
+        if self._loop:
+            self._loop.create_task(sqs_shutdown())
+            LOGGER.debug("Stop worker")
+            self.running = False
+            for event in self._events.get("shutdown", []):
+                self._loop.run_until_complete(event())
+            if self._main_task:
+                self._main_task.cancel()
 
-        self._main_task.cancel()
-
-    def task(self, task_name: str):
-        def decorator(func):
+    def task(self, task_name: str) -> Callable[[Callable[[], None]], None]:
+        def decorator(func: Callable[[], Any]) -> None:
             self.handlers[task_name] = func
+
+        return decorator
+
+    def on_event(
+        self, event_name: Literal[""]
+    ) -> Callable[[Callable[[], None]], None]:
+        def decorator(func: Callable[[], None]) -> None:
+            if event_name not in self._events:
+                self._events[event_name] = [func]
+            else:
+                self._events[event_name] = [*self._events[event_name], func]
 
         return decorator
 
@@ -89,7 +106,12 @@ class Worker:
 
         self._loop.run_until_complete(sqs_startup())
         self._main_task = loop.create_task(self.consumer())
-        self._main_task.add_done_callback(partial(self._stop_worker, self))
+        if self._main_task:
+            self._main_task.add_done_callback(partial(self._stop_worker, self))
+
+        for event in self._events.get("startup", []):
+            self._loop.run_until_complete(event())
+
         self._loop.run_until_complete(self._main_task)
 
     def _delete_message(
@@ -116,6 +138,9 @@ class Worker:
                 "The task %s has not a candidate to be proceeded",
                 body["task_name"],
             )
+            return
+        if not self._loop:
+            LOGGER.warning("The main event loop is not initialized")
             return
         task = self._loop.create_task(
             retry_call(
