@@ -1,4 +1,5 @@
 from async_sqs_consumer.queue import (
+    delete_messages,
     get_queue_messages,
 )
 from async_sqs_consumer.resources import (
@@ -7,6 +8,9 @@ from async_sqs_consumer.resources import (
 )
 from async_sqs_consumer.utils import (
     validate_message,
+)
+from async_sqs_consumer.utils.retry import (
+    retry_call,
 )
 import asyncio
 from contextlib import (
@@ -88,6 +92,14 @@ class Worker:
         self._main_task.add_done_callback(partial(self._stop_worker, self))
         self._loop.run_until_complete(self._main_task)
 
+    def _delete_message(
+        self, _future: asyncio.Future, *, receipt_handle: Any
+    ) -> None:
+        asyncio.ensure_future(
+            delete_messages(self.queue_url, receipt_handle),
+            loop=self._loop,
+        )
+
     async def _process_message(self, message_content: dict[str, Any]) -> None:
         try:
             body = json.loads(message_content["Body"])
@@ -106,7 +118,18 @@ class Worker:
             )
             return
         task = self._loop.create_task(
-            handler(*body.get("args", []), **body.get("kwargs", {}))
+            retry_call(
+                handler,
+                fargs=body.get("args", []),
+                fkwargs=body.get("kwargs", {}),
+                tries=body.get("retries", 1),
+            )
+        )
+        task.add_done_callback(
+            partial(
+                self._delete_message,
+                receipt_handle=message_content["ReceiptHandle"],
+            )
         )
 
     async def consumer(self) -> None:
