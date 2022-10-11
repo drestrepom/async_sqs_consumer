@@ -1,6 +1,7 @@
 # Async SQS consumer
 
-Python asynchronous (**async** / **await**) worker for consuming messages from AWS SQS.
+Python asynchronous (**async** / **await**) worker for consuming messages
+from AWS SQS.
 
 This is a hobby project, if you find the project interesting
 any contribution is welcome.
@@ -9,14 +10,17 @@ any contribution is welcome.
 
 You must create an instance of the worker with the url of the queue.
 
-Aws credentials are taken from environment variables, you must set the following environment variables.
+Aws credentials are taken from environment variables, you must set the
+following environment variables. Or you can provide a Context object with the
+aws credentials `async_sqs_consumer.types.Context`
 
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
 
 Example:
 
-You can get the queue url with the follow aws cli command `aws sqs get-queue-url --queue-name xxxxxx`
+You can get the queue url with the follow aws cli command
+`aws sqs get-queue-url --queue-name xxxxxx`
 
 ```python
 # test_worker.py

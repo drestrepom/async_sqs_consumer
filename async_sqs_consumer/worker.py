@@ -6,6 +6,9 @@ from async_sqs_consumer.resources import (
     sqs_shutdown,
     sqs_startup,
 )
+from async_sqs_consumer.types import (
+    Context,
+)
 from async_sqs_consumer.utils import (
     validate_message,
 )
@@ -36,8 +39,21 @@ LOGGER = logging.getLogger(__name__)
 
 
 class Worker:
-    def __init__(self, queue_url: str) -> None:
-        self.queue_url = queue_url
+    def __init__(
+        self,
+        queue_url: Optional[str] = None,
+        context: Optional[Context] = None,
+    ) -> None:
+        if context and not context.queue_url:
+            if not queue_url:
+                raise AttributeError("Must provide the queue url")
+            context._replace(queue_url=queue_url)
+
+        if not queue_url or not context or not context.queue_url:
+            raise AttributeError("Must provide the queue url")
+
+        self._context = context or Context(queue_url=queue_url)
+
         self.running = False
         self.handlers: dict[str, Callable[..., Any]] = {}
         self._events: dict[str, list[Callable[[], None]]]
@@ -47,15 +63,11 @@ class Worker:
     def _sigint_handler(self, *_args: Any) -> None:
         sys.stdout.write("\b\b\r")
         sys.stdout.flush()
-        logging.getLogger("system").warning(
-            "Received <ctrl+c> interrupt [SIGINT]"
-        )
+        logging.getLogger("system").warning("Received <ctrl+c> interrupt [SIGINT]")
         self._stop_worker()
 
     def _sigterm_handler(self, *_args: Any) -> None:
-        logging.getLogger("system").warning(
-            "Received termination signal [SIGTERM]"
-        )
+        logging.getLogger("system").warning("Received termination signal [SIGTERM]")
         self._stop_worker()
 
     def _stop_worker(self, *_: Any) -> None:
@@ -64,19 +76,39 @@ class Worker:
             LOGGER.debug("Stop worker")
             self.running = False
             for event in self._events.get("shutdown", []):
-                self._loop.run_until_complete(event())
+                self._loop.run_until_complete(event())  # type: ignore
             if self._main_task:
                 self._main_task.cancel()
 
-    def task(self, task_name: str) -> Callable[[Callable[[], None]], None]:
+    def task(self, name: str) -> Callable[[Callable[[], None]], None]:
+        """A decorator to add a task that could be handled by the worker.
+
+        Args:
+            name (str): tasks received with this name will be
+            processed by the decorated function
+        Returns:
+            Callable[[Callable[[], None]], None]: _description_
+        """
+
         def decorator(func: Callable[[], Any]) -> None:
-            self.handlers[task_name] = func
+            self.handlers[name] = func
 
         return decorator
 
     def on_event(
-        self, event_name: Literal[""]
+        self, event_name: Literal["startup", "shutdown"]
     ) -> Callable[[Callable[[], None]], None]:
+        """Yo can define event handlers that need to be executed before
+        the application startups, or when the application is shutting down.
+        The valid events are `startup`, `shutdown`.
+
+        Args:
+            event_name (Literal[&quot;startup&quot;, &quot;shutdown&quot;]):
+
+        Returns:
+            Callable[[Callable[[], None]], None]:
+        """
+
         def decorator(func: Callable[[], None]) -> None:
             if event_name not in self._events:
                 self._events[event_name] = [func]
@@ -85,9 +117,16 @@ class Worker:
 
         return decorator
 
-    def start(self) -> None:
+    def start(self, event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        """Start the workert
+
+        Args:
+            event_loop (Optional[asyncio.AbstractEventLoop], optional):
+            if an eventloop is already running you can run the worker in it.
+            Defaults to None.
+        """
         self.running = True
-        loop = asyncio.get_event_loop()
+        loop = event_loop or asyncio.get_event_loop()
         self._loop = loop
 
         if self._loop and self._loop.is_closed():
@@ -105,20 +144,22 @@ class Worker:
         signal.signal(signal.SIGTERM, partial(self._sigterm_handler, self))
 
         self._loop.run_until_complete(sqs_startup())
-        self._main_task = loop.create_task(self.consumer())
+        self._main_task = loop.create_task(self._consumer())
         if self._main_task:
             self._main_task.add_done_callback(partial(self._stop_worker, self))
 
         for event in self._events.get("startup", []):
-            self._loop.run_until_complete(event())
+            self._loop.run_until_complete(event())  # type: ignore
 
         self._loop.run_until_complete(self._main_task)
 
-    def _delete_message(
-        self, _future: asyncio.Future, *, receipt_handle: Any
-    ) -> None:
+    def _delete_message(self, _future: asyncio.Future, *, receipt_handle: Any) -> None:
         asyncio.ensure_future(
-            delete_messages(self.queue_url, receipt_handle),
+            delete_messages(
+                self._context.queue_url,
+                receipt_handle,
+                self._context.aws_credentials,
+            ),
             loop=self._loop,
         )
 
@@ -157,9 +198,11 @@ class Worker:
             )
         )
 
-    async def consumer(self) -> None:
+    async def _consumer(self) -> None:
         while self.running:
             with suppress(asyncio.CancelledError):
-                messages = await get_queue_messages(self.queue_url)
+                messages = await get_queue_messages(
+                    self._context.queue_url, self._context.aws_credentials
+                )
                 for message in messages:
                     await self._process_message(message)
