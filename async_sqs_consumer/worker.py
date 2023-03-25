@@ -1,13 +1,5 @@
 from async_sqs_consumer.queue import (
-    delete_messages,
-    get_queue_messages,
-)
-from async_sqs_consumer.resources import (
-    sqs_shutdown,
-    sqs_startup,
-)
-from async_sqs_consumer.types import (
-    Context,
+    Queue,
 )
 from async_sqs_consumer.utils import (
     validate_message,
@@ -32,6 +24,9 @@ from typing import (
     Literal,
     Optional,
 )
+from uuid import (
+    uuid4,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -41,44 +36,47 @@ LOGGER = logging.getLogger(__name__)
 class Worker:
     def __init__(
         self,
-        queue_url: Optional[str] = None,
-        context: Optional[Context] = None,
+        queues: dict[str, Queue],
     ) -> None:
-        if context and not context.queue_url:
-            if not queue_url:
-                raise AttributeError("Must provide the queue url")
-            context._replace(queue_url=queue_url)
-
-        if not queue_url or not context or not context.queue_url:
-            raise AttributeError("Must provide the queue url")
-
-        self._context = context or Context(queue_url=queue_url)
-
+        self.queues = queues
         self.running = False
         self.handlers: dict[str, Callable[..., Any]] = {}
-        self._events: dict[str, list[Callable[[], None]]]
+        self._events: dict[str, list[Callable[[], None]]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._main_task: Optional[asyncio.Task] = None
+        self._tasks: list[asyncio.Task] = []
 
     def _sigint_handler(self, *_args: Any) -> None:
         sys.stdout.write("\b\b\r")
         sys.stdout.flush()
-        logging.getLogger("system").warning("Received <ctrl+c> interrupt [SIGINT]")
+        logging.getLogger("system").warning(
+            "Received <ctrl+c> interrupt [SIGINT]"
+        )
         self._stop_worker()
 
     def _sigterm_handler(self, *_args: Any) -> None:
-        logging.getLogger("system").warning("Received termination signal [SIGTERM]")
+        logging.getLogger("system").warning(
+            "Received termination signal [SIGTERM]"
+        )
         self._stop_worker()
 
     def _stop_worker(self, *_: Any) -> None:
         if self._loop:
-            self._loop.create_task(sqs_shutdown())
             LOGGER.debug("Stop worker")
             self.running = False
+            for queue in self.queues.values():
+                queue.stop_polling()
             for event in self._events.get("shutdown", []):
                 self._loop.run_until_complete(event())  # type: ignore
-            if self._main_task:
-                self._main_task.cancel()
+            for task in self._tasks:
+                task.cancel()
+            _queue_tasks = [
+                task
+                for task in asyncio.all_tasks(self._loop)
+                if task.get_name().startswith("task_queue_")
+            ]
+            # TODO: make sure all tasks are finished before finishing the entire process
+
+            self._loop.stop()
 
     def task(self, name: str) -> Callable[[Callable[[], None]], None]:
         """A decorator to add a task that could be handled by the worker.
@@ -117,7 +115,9 @@ class Worker:
 
         return decorator
 
-    def start(self, event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+    def start(
+        self, event_loop: Optional[asyncio.AbstractEventLoop] = None
+    ) -> None:
         """Start the workert
 
         Args:
@@ -143,27 +143,28 @@ class Worker:
         signal.signal(signal.SIGINT, partial(self._sigint_handler, self))
         signal.signal(signal.SIGTERM, partial(self._sigterm_handler, self))
 
-        self._loop.run_until_complete(sqs_startup())
-        self._main_task = loop.create_task(self._consumer())
-        if self._main_task:
-            self._main_task.add_done_callback(partial(self._stop_worker, self))
+        for queue_name, queue in self.queues.items():
+            polling_daemon_task = loop.create_task(
+                queue.start_polling(self._consumer_callback, queue_name)
+            )
+            self._tasks = [*self._tasks, polling_daemon_task]
 
         for event in self._events.get("startup", []):
             self._loop.run_until_complete(event())  # type: ignore
 
-        self._loop.run_until_complete(self._main_task)
+        self._loop.run_forever()
 
-    def _delete_message(self, _future: asyncio.Future, *, receipt_handle: Any) -> None:
+    def _delete_message(
+        self, _future: asyncio.Future, *, receipt_handle: Any, queue_alias: str
+    ) -> None:
         asyncio.ensure_future(
-            delete_messages(
-                self._context.queue_url,
-                receipt_handle,
-                self._context.aws_credentials,
-            ),
+            self.queues[queue_alias].delete_messages(receipt_handle),
             loop=self._loop,
         )
 
-    async def _process_message(self, message_content: dict[str, Any]) -> None:
+    async def _process_message(
+        self, message_content: dict[str, Any], queue_alias: str
+    ) -> None:
         try:
             body = json.loads(message_content["Body"])
         except json.JSONDecodeError:
@@ -189,20 +190,19 @@ class Worker:
                 fargs=body.get("args", []),
                 fkwargs=body.get("kwargs", {}),
                 tries=body.get("retries", 1),
-            )
+            ),
+            name=f"task_queue_{queue_alias}_{uuid4().hex[:8]}",
         )
         task.add_done_callback(
             partial(
                 self._delete_message,
                 receipt_handle=message_content["ReceiptHandle"],
+                queue_alias=queue_alias,
             )
         )
 
-    async def _consumer(self) -> None:
-        while self.running:
-            with suppress(asyncio.CancelledError):
-                messages = await get_queue_messages(
-                    self._context.queue_url, self._context.aws_credentials
-                )
-                for message in messages:
-                    await self._process_message(message)
+    async def _consumer_callback(
+        self, message: dict[str, Any], queue_alias: str
+    ) -> None:
+        with suppress(asyncio.CancelledError):
+            await self._process_message(message, queue_alias)
