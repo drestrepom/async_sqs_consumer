@@ -10,11 +10,15 @@ from async_sqs_consumer.resources import (
 from async_sqs_consumer.types import (
     AwsCredentials,
 )
+from async_sqs_consumer.utils import (
+    TASK_NAME_PREFIX,
+)
 from async_sqs_consumer.utils.retry import (
     retry,
 )
 import asyncio
 from asyncio import (
+    get_event_loop,
     sleep,
 )
 from botocore.client import (
@@ -26,6 +30,7 @@ from botocore.exceptions import (
 from contextlib import (
     suppress,
 )
+import logging
 from typing import (
     Any,
     Callable,
@@ -33,6 +38,7 @@ from typing import (
     Optional,
 )
 
+LOGGER = logging.getLogger(__name__)
 NETWORK_ERRORS = (
     ServerDisconnectedError,
     ClientConnectorError,
@@ -71,27 +77,44 @@ async def delete_messages(
 
 
 class Queue:
-    def __init__(
+    def __init__(  # pytlint: disable=too-many-arguments
         self,
         url: str,
         authentication: Optional[AwsCredentials] = None,
         polling_interval: Optional[float] = None,
         visibility_timeout: Optional[int] = None,
+        max_queue_parallel_messages: Optional[int] = None,
     ) -> None:
         self.url = url
         self.authentication = authentication
         self.polling_interval = polling_interval or 1.0
         self.visibility_timeout = visibility_timeout or 60
+        self._max_queue_parallel_messages = max_queue_parallel_messages
         self._polling = False
 
     async def start_polling(
         self,
         callback: Callable[[dict[str, Any], str], Coroutine[Any, Any, None]],
         queue_alias: str,
+        max_parallel_messages: Optional[int] = None,
     ) -> None:
         self._polling = self._polling or True
         async with SESSION.client(**RESOURCE_OPTIONS_SQS) as sqs_client:
             while self._polling:
+                if len(
+                    [
+                        task
+                        for task in asyncio.all_tasks(get_event_loop())
+                        if task.get_name().startswith(TASK_NAME_PREFIX)
+                    ]
+                ) > (
+                    self._max_queue_parallel_messages
+                    or max_parallel_messages
+                    or 1024
+                ):
+                    await sleep(self.polling_interval)
+                    continue
+
                 with suppress(asyncio.CancelledError):
                     messages = await get_queue_messages(
                         self.url,

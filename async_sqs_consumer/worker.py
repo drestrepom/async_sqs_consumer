@@ -3,6 +3,7 @@ from async_sqs_consumer.queue import (
 )
 from async_sqs_consumer.utils import (
     FailedValidation,
+    TASK_NAME_PREFIX,
     validate_message,
 )
 from async_sqs_consumer.utils.retry import (
@@ -34,10 +35,9 @@ logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 
 
-class Worker:
+class Worker:  # pylint: disable=too-many-instance-attributes
     def __init__(
-        self,
-        queues: dict[str, Queue],
+        self, queues: dict[str, Queue], max_workers: Optional[int] = None
     ) -> None:
         self.queues = queues
         self.running = False
@@ -46,6 +46,7 @@ class Worker:
         self._events: dict[str, list[Callable[[], None]]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._tasks: list[asyncio.Task] = []
+        self._max_workers = max_workers or 1024
 
     def _sigint_handler(self, *_args: Any) -> None:
         sys.stdout.write("\b\b\r")
@@ -74,7 +75,7 @@ class Worker:
             _queue_tasks = [
                 task
                 for task in asyncio.all_tasks(self._loop)
-                if task.get_name().startswith("task_queue_")
+                if task.get_name().startswith(TASK_NAME_PREFIX)
             ]
             # TODO: make sure all tasks are finished before finishing the entire process
 
@@ -82,7 +83,7 @@ class Worker:
 
     def task(
         self, name: str, queue_name: Optional[str] = None
-    ) -> Callable[[Callable[[], None]], None]:
+    ) -> Callable[..., None]:
         """A decorator to add a task that could be handled by the worker.
 
         Args:
@@ -155,7 +156,11 @@ class Worker:
 
         for queue_name, queue in self.queues.items():
             polling_daemon_task = loop.create_task(
-                queue.start_polling(self._consumer_callback, queue_name)
+                queue.start_polling(
+                    self._consumer_callback,
+                    queue_name,
+                    max_parallel_messages=self._max_workers,
+                )
             )
             self._tasks = [*self._tasks, polling_daemon_task]
 
@@ -207,7 +212,10 @@ class Worker:
                 fkwargs=body.get("kwargs", {}),
                 tries=body.get("retries", 1),
             ),
-            name=f"task_queue_{queue_alias}_{uuid4().hex[:8]}",
+            name=(
+                f"{TASK_NAME_PREFIX}{queue_alias}"
+                f"_{body['task']}_{uuid4().hex[:8]}"
+            ),
         )
         task.add_done_callback(
             partial(
