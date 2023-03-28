@@ -15,6 +15,10 @@ from typing import (
 )
 
 
+class FailedValidation(Exception):
+    pass
+
+
 def validate_message(message: dict[str, Any]) -> bool:
     with suppress(ValidationError):
         validate(message, MESSAGE_SCHEMA)

@@ -2,6 +2,7 @@ from async_sqs_consumer.queue import (
     Queue,
 )
 from async_sqs_consumer.utils import (
+    FailedValidation,
     validate_message,
 )
 from async_sqs_consumer.utils.retry import (
@@ -41,6 +42,7 @@ class Worker:
         self.queues = queues
         self.running = False
         self.handlers: dict[str, Callable[..., Any]] = {}
+        self.handlers_by_queue: dict[str, dict[str, Callable[..., Any]]] = {}
         self._events: dict[str, list[Callable[[], None]]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._tasks: list[asyncio.Task] = []
@@ -78,7 +80,9 @@ class Worker:
 
             self._loop.stop()
 
-    def task(self, name: str) -> Callable[[Callable[[], None]], None]:
+    def task(
+        self, name: str, queue_name: Optional[str] = None
+    ) -> Callable[[Callable[[], None]], None]:
         """A decorator to add a task that could be handled by the worker.
 
         Args:
@@ -89,7 +93,13 @@ class Worker:
         """
 
         def decorator(func: Callable[[], Any]) -> None:
-            self.handlers[name] = func
+            if queue_name:
+                if queue_name not in self.handlers_by_queue:
+                    self.handlers_by_queue[queue_name] = {name: func}
+                else:
+                    self.handlers_by_queue[queue_name][name] = func
+            else:
+                self.handlers[name] = func
 
         return decorator
 
@@ -155,7 +165,11 @@ class Worker:
         self._loop.run_forever()
 
     def _delete_message(
-        self, _future: asyncio.Future, *, receipt_handle: Any, queue_alias: str
+        self,
+        _future: Optional[asyncio.Future],
+        *,
+        receipt_handle: Any,
+        queue_alias: str,
     ) -> None:
         asyncio.ensure_future(
             self.queues[queue_alias].delete_messages(receipt_handle),
@@ -164,26 +178,28 @@ class Worker:
 
     async def _process_message(
         self, message_content: dict[str, Any], queue_alias: str
-    ) -> None:
+    ) -> bool:
         try:
             body = json.loads(message_content["Body"])
         except json.JSONDecodeError:
-            return
+            return False
 
         if not validate_message(body):
             LOGGER.error("Failed to validate message")
-            return
+            return False
 
-        handler = self.handlers.get(body["task"])
+        handler = self.handlers_by_queue.get(queue_alias, {}).get(body["task"])
+        handler = handler or self.handlers.get(body["task"])
         if not handler:
             LOGGER.warning(
                 "The task %s has not a candidate to be proceeded",
-                body["task_name"],
+                body["task"],
             )
-            return
+            return False
+
         if not self._loop:
             LOGGER.warning("The main event loop is not initialized")
-            return
+            return False
         task = self._loop.create_task(
             retry_call(
                 handler,
@@ -200,9 +216,14 @@ class Worker:
                 queue_alias=queue_alias,
             )
         )
+        return True
 
     async def _consumer_callback(
         self, message: dict[str, Any], queue_alias: str
     ) -> None:
         with suppress(asyncio.CancelledError):
-            await self._process_message(message, queue_alias)
+            success = await self._process_message(message, queue_alias)
+            if not success:
+                await self.queues[queue_alias].delete_messages(
+                    message["ReceiptHandle"]
+                )
