@@ -14,6 +14,8 @@ from typing import (
     Any,
 )
 
+TASK_NAME_PREFIX = "task_queue_"
+
 
 class FailedValidation(Exception):
     pass

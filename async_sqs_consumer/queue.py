@@ -77,7 +77,7 @@ async def delete_messages(
 
 
 class Queue:
-    def __init__(  # pytlint: disable=too-many-arguments
+    def __init__(  # pytlint: disable=too-many-arguments,too-many-arguments
         self,
         url: str,
         authentication: Optional[AwsCredentials] = None,
