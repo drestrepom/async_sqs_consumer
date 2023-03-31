@@ -2,7 +2,6 @@ from async_sqs_consumer.queue import (
     Queue,
 )
 from async_sqs_consumer.utils import (
-    FailedValidation,
     TASK_NAME_PREFIX,
     validate_message,
 )
@@ -13,11 +12,15 @@ import asyncio
 from contextlib import (
     suppress,
 )
+from datetime import (
+    datetime,
+)
 from functools import (
     partial,
 )
 import json
 import logging
+import pytz
 import signal
 import sys
 from typing import (
@@ -173,9 +176,21 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         self,
         _future: Optional[asyncio.Future],
         *,
+        handler_name: str,
+        task_id: str,
         receipt_handle: Any,
         queue_alias: str,
+        start_time: float,
     ) -> None:
+        start_date = datetime.fromtimestamp(start_time, pytz.UTC)
+        end_date = datetime.utcnow().replace(tzinfo=pytz.UTC)
+        total_seconds = end_date - start_date
+        LOGGER.info(
+            "Task %s[%s] succeeded in %ss: None",
+            handler_name,
+            task_id,
+            total_seconds.seconds,
+        )
         asyncio.ensure_future(
             self.queues[queue_alias].delete_messages(receipt_handle),
             loop=self._loop,
@@ -193,6 +208,7 @@ class Worker:  # pylint: disable=too-many-instance-attributes
             LOGGER.error("Failed to validate message")
             return False
 
+        LOGGER.info("Task %s[%s] received", body["task"], body["id"])
         handler = self.handlers_by_queue.get(queue_alias, {}).get(body["task"])
         handler = handler or self.handlers.get(body["task"])
         if not handler:
@@ -222,6 +238,9 @@ class Worker:  # pylint: disable=too-many-instance-attributes
                 self._delete_message,
                 receipt_handle=message_content["ReceiptHandle"],
                 queue_alias=queue_alias,
+                start_time=datetime.utcnow().timestamp(),
+                handler_name=body["task"],
+                task_id=body["id"],
             )
         )
         return True

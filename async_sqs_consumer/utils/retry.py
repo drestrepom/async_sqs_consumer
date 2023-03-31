@@ -1,30 +1,40 @@
+import asyncio
 import functools
 from functools import (
     partial,
 )
 import logging
 import random
-from time import (
-    sleep,
-)
 import traceback
+from typing import (
+    Any,
+    Callable,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
 logging_logger = logging.getLogger(__name__)
 
 
 async def __retry_internal(  # pylint: disable=too-many-arguments
-    func,
-    exceptions=Exception,
-    tries=-1,
-    delay=0,
-    max_delay=None,
-    backoff=1,
-    jitter=0,
-    logger=logging_logger,
-    log_traceback=False,
-    on_exception=None,
+    func: partial,
+    tries: int,
+    exceptions: Union[
+        Type[BaseException], list[type[BaseException]]
+    ] = Exception,
+    delay: Optional[float] = None,
+    max_delay: Optional[float] = None,
+    backoff: Optional[float] = None,
+    jitter: Union[Literal[1], Literal[0]] = 0,
+    logger: Optional[logging.Logger] = None,
+    log_traceback: bool = False,
+    on_exception: Optional[Callable[[Type[Exception]], bool]] = None,
 ):
-    _tries, _delay = tries, delay
+    _tries, _delay = tries, (delay or 0)
+    logger = logger or logging_logger
     while _tries:
         try:
             return await func()
@@ -53,8 +63,8 @@ async def __retry_internal(  # pylint: disable=too-many-arguments
                 if log_traceback:
                     logger.warning(traceback.format_exc())
 
-            sleep(_delay)
-            _delay *= backoff
+            await asyncio.sleep(_delay)
+            _delay *= backoff or 1
 
             if isinstance(jitter, tuple):
                 _delay += random.uniform(*jitter)
@@ -66,15 +76,17 @@ async def __retry_internal(  # pylint: disable=too-many-arguments
 
 
 def retry(
-    exceptions=Exception,
-    tries=-1,
-    delay=0,
-    max_delay=None,
-    backoff=1,
-    jitter=0,
-    logger=logging_logger,
-    log_traceback=False,
-    on_exception=None,
+    tries: int,
+    exceptions: Union[
+        Type[BaseException], list[type[BaseException]]
+    ] = Exception,
+    delay: Optional[float] = None,
+    max_delay: Optional[float] = None,
+    backoff: Optional[float] = None,
+    jitter: Union[Literal[1], Literal[0]] = 0,
+    logger: Optional[logging.Logger] = None,
+    log_traceback: bool = False,
+    on_exception: Optional[Callable[[Type[Exception]], bool]] = None,
 ):
     def decorator(func):
         @functools.wraps(func)
@@ -83,8 +95,8 @@ def retry(
             kwargs = fkwargs if fkwargs else {}
             return await __retry_internal(
                 partial(func, *args, **kwargs),
-                exceptions,
                 tries,
+                exceptions,
                 delay,
                 max_delay,
                 backoff,
@@ -100,23 +112,25 @@ def retry(
 
 
 async def retry_call(
-    func,
-    fargs=None,
-    fkwargs=None,
-    exceptions=Exception,
-    tries=-1,
-    delay=0,
-    max_delay=None,
-    backoff=1,
-    jitter=0,
-    logger=logging_logger,
+    func: partial,
+    tries: int,
+    exceptions: Union[
+        Type[BaseException], list[type[BaseException]]
+    ] = Exception,
+    delay: Optional[float] = None,
+    max_delay: Optional[float] = None,
+    backoff: Optional[float] = None,
+    jitter: Union[Literal[1], Literal[0]] = 0,
+    logger: Optional[logging.Logger] = None,
+    fargs: Optional[Tuple[Any, ...]] = None,
+    fkwargs: Optional[dict[str, Any]] = None,
 ):
-    args = fargs if fargs else []
+    args = fargs if fargs else tuple()
     kwargs = fkwargs if fkwargs else {}
     return await __retry_internal(
         partial(func, *args, **kwargs),
-        exceptions,
         tries,
+        exceptions,
         delay,
         max_delay,
         backoff,
