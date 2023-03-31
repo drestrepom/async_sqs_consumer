@@ -26,6 +26,7 @@ import sys
 from typing import (
     Any,
     Callable,
+    Iterable,
     Literal,
     Optional,
 )
@@ -172,15 +173,15 @@ class Worker:  # pylint: disable=too-many-instance-attributes
 
         self._loop.run_forever()
 
-    def _delete_message(
+    def _finish_message(
         self,
         _future: Optional[asyncio.Future],
         *,
         handler_name: str,
         task_id: str,
-        receipt_handle: Any,
         queue_alias: str,
         start_time: float,
+        receipt_handle: Optional[Any] = None,
     ) -> None:
         start_date = datetime.fromtimestamp(start_time, pytz.UTC)
         end_date = datetime.utcnow().replace(tzinfo=pytz.UTC)
@@ -191,10 +192,64 @@ class Worker:  # pylint: disable=too-many-instance-attributes
             task_id,
             total_seconds.seconds,
         )
+        if receipt_handle:
+            self._delete_message(receipt_handle, queue_alias)
+
+    def _delete_message(
+        self,
+        receipt_handle: Any,
+        queue_alias: str,
+    ) -> None:
         asyncio.ensure_future(
             self.queues[queue_alias].delete_messages(receipt_handle),
             loop=self._loop,
         )
+
+    async def queue_message_to_worker(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        task_name: Optional[str] = None,
+        queue_alias: Optional[str] = None,
+        retries: Optional[int] = None,
+        receipt_handler: Optional[Any] = None,
+        args: Optional[Iterable[Any]] = None,
+        kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        task_id = task_id or uuid4().hex
+        LOGGER.info("Task %s[%s] received", task_name, task_id)
+        handler = self.handlers_by_queue.get(queue_alias, {}).get(task_name)
+        handler = handler or self.handlers.get(task_name)
+        if not handler:
+            LOGGER.warning(
+                "The task %s has not a candidate to be proceeded",
+                task_name,
+            )
+            return False
+
+        task = self._loop.create_task(
+            retry_call(
+                handler,
+                fargs=args or [],
+                fkwargs=kwargs or {},
+                tries=retries or 1,
+            ),
+            name=(
+                f"{TASK_NAME_PREFIX}{queue_alias}"
+                f"_{task_name}_{uuid4().hex[:8]}"
+            ),
+        )
+        task.add_done_callback(
+            partial(
+                self._finish_message,
+                receipt_handle=receipt_handler,
+                queue_alias=queue_alias,
+                start_time=datetime.utcnow().timestamp(),
+                handler_name=task_name,
+                task_id=task_id,
+            )
+        )
+        return True
 
     async def _process_message(
         self, message_content: dict[str, Any], queue_alias: str
@@ -208,42 +263,15 @@ class Worker:  # pylint: disable=too-many-instance-attributes
             LOGGER.error("Failed to validate message")
             return False
 
-        LOGGER.info("Task %s[%s] received", body["task"], body["id"])
-        handler = self.handlers_by_queue.get(queue_alias, {}).get(body["task"])
-        handler = handler or self.handlers.get(body["task"])
-        if not handler:
-            LOGGER.warning(
-                "The task %s has not a candidate to be proceeded",
-                body["task"],
-            )
-            return False
-
-        if not self._loop:
-            LOGGER.warning("The main event loop is not initialized")
-            return False
-        task = self._loop.create_task(
-            retry_call(
-                handler,
-                fargs=body.get("args", []),
-                fkwargs=body.get("kwargs", {}),
-                tries=body.get("retries", 1),
-            ),
-            name=(
-                f"{TASK_NAME_PREFIX}{queue_alias}"
-                f"_{body['task']}_{uuid4().hex[:8]}"
-            ),
+        await self.queue_message_to_worker(
+            task_id=body["id"],
+            task_name=body["task"],
+            queue_alias=queue_alias,
+            retries=body.get("retries", 1),
+            receipt_handler=message_content["ReceiptHandle"],
+            args=body.get("args", []),
+            kwargs=body.get("kwargs", {}),
         )
-        task.add_done_callback(
-            partial(
-                self._delete_message,
-                receipt_handle=message_content["ReceiptHandle"],
-                queue_alias=queue_alias,
-                start_time=datetime.utcnow().timestamp(),
-                handler_name=body["task"],
-                task_id=body["id"],
-            )
-        )
-        return True
 
     async def _consumer_callback(
         self, message: dict[str, Any], queue_alias: str
