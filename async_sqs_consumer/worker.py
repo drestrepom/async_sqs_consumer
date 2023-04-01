@@ -186,14 +186,19 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         start_date = datetime.fromtimestamp(start_time, pytz.UTC)
         end_date = datetime.utcnow().replace(tzinfo=pytz.UTC)
         total_seconds = end_date - start_date
-        LOGGER.info(
-            "Task %s[%s] succeeded in %ss: None",
-            handler_name,
-            task_id,
-            total_seconds.seconds,
-        )
-        if receipt_handle:
-            self._delete_message(receipt_handle, queue_alias)
+        if _future.exception() is not None:
+            LOGGER.warning(
+                "Failed to execute task %s[%s]", handler_name, task_id
+            )
+        else:
+            LOGGER.info(
+                "Task %s[%s] succeeded in %ss: None",
+                handler_name,
+                task_id,
+                total_seconds.seconds,
+            )
+            if receipt_handle:
+                self._delete_message(receipt_handle, queue_alias)
 
     def _delete_message(
         self,
