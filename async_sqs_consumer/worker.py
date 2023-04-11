@@ -74,15 +74,16 @@ class Worker:  # pylint: disable=too-many-instance-attributes
                 queue.stop_polling()
             for event in self._events.get("shutdown", []):
                 self._loop.run_until_complete(event())  # type: ignore
-            for task in self._tasks:
-                task.cancel()
+
+            map(lambda task: task.cancel(), self._tasks)
+
             _queue_tasks = [
                 task
                 for task in asyncio.all_tasks(self._loop)
                 if task.get_name().startswith(TASK_NAME_PREFIX)
             ]
-            # TODO: make sure all tasks are finished before finishing the entire process
-
+            # TODO: make sure all tasks are finished before finishing the
+            # entire process
             self._loop.stop()
 
     def task(
@@ -158,6 +159,9 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         signal.signal(signal.SIGINT, partial(self._sigint_handler, self))
         signal.signal(signal.SIGTERM, partial(self._sigterm_handler, self))
 
+        for event in self._events.get("startup", []):
+            self._loop.run_until_complete(event())  # type: ignore
+
         for queue_name, queue in self.queues.items():
             polling_daemon_task = loop.create_task(
                 queue.start_polling(
@@ -167,9 +171,6 @@ class Worker:  # pylint: disable=too-many-instance-attributes
                 )
             )
             self._tasks = [*self._tasks, polling_daemon_task]
-
-        for event in self._events.get("startup", []):
-            self._loop.run_until_complete(event())  # type: ignore
 
         self._loop.run_forever()
 
@@ -186,7 +187,7 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         start_date = datetime.fromtimestamp(start_time, pytz.UTC)
         end_date = datetime.utcnow().replace(tzinfo=pytz.UTC)
         total_seconds = end_date - start_date
-        if _future.exception() is not None:
+        if _future and _future.exception() is not None:
             LOGGER.warning(
                 "Failed to execute task %s[%s]", handler_name, task_id
             )
@@ -220,11 +221,20 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         receipt_handler: Optional[Any] = None,
         args: Optional[Iterable[Any]] = None,
         kwargs: Optional[dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         task_id = task_id or uuid4().hex
         LOGGER.info("Task %s[%s] received", task_name, task_id)
-        handler = self.handlers_by_queue.get(queue_alias, {}).get(task_name)
-        handler = handler or self.handlers.get(task_name)
+
+        if not self._loop:
+            return False
+
+        handler = None
+        if queue_alias:
+            if task_name:
+                handler = self.handlers_by_queue.get(queue_alias, {}).get(
+                    task_name
+                )
+                handler = handler or self.handlers.get(task_name)
         if not handler:
             LOGGER.warning(
                 "The task %s has not a candidate to be proceeded",
@@ -235,7 +245,7 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         task = self._loop.create_task(
             retry_call(
                 handler,
-                fargs=args or [],
+                fargs=tuple(args or []),
                 fkwargs=kwargs or {},
                 tries=retries or 1,
             ),
@@ -256,7 +266,7 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         )
         return True
 
-    async def _process_message(
+    async def _process_queue_message(
         self, message_content: dict[str, Any], queue_alias: str
     ) -> bool:
         try:
@@ -278,11 +288,13 @@ class Worker:  # pylint: disable=too-many-instance-attributes
             kwargs=body.get("kwargs", {}),
         )
 
+        return True
+
     async def _consumer_callback(
         self, message: dict[str, Any], queue_alias: str
     ) -> None:
         with suppress(asyncio.CancelledError):
-            success = await self._process_message(message, queue_alias)
+            success = await self._process_queue_message(message, queue_alias)
             if not success:
                 await self.queues[queue_alias].delete_messages(
                     message["ReceiptHandle"]

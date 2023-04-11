@@ -112,7 +112,7 @@ def retry(
 
 
 async def retry_call(
-    func: partial,
+    func: Union[partial, Callable[..., Any]],
     tries: int,
     exceptions: Union[
         Type[BaseException], list[type[BaseException]]
