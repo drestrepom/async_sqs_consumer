@@ -305,7 +305,7 @@ class Worker:  # pylint: disable=too-many-instance-attributes
                         if task.get_name().startswith(TASK_NAME_PREFIX)
                     ]
                 ) > (self._max_workers):
-                    await sleep(1)  # type: ignore
+                    await asyncio.sleep(1)
                     continue
 
                 for queue_alias, queue in queues:
