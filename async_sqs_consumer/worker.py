@@ -1,6 +1,10 @@
 from async_sqs_consumer.queue import (
     Queue,
 )
+from async_sqs_consumer.resources import (
+    RESOURCE_OPTIONS_SQS,
+    SESSION,
+)
 from async_sqs_consumer.utils import (
     TASK_NAME_PREFIX,
     validate_message,
@@ -23,6 +27,9 @@ import logging
 import pytz
 import signal
 import sys
+from time import (
+    sleep,
+)
 from typing import (
     Any,
     Callable,
@@ -45,7 +52,6 @@ class Worker:  # pylint: disable=too-many-instance-attributes
     ) -> None:
         self.queues = queues
         self.running = False
-        self.handlers: dict[str, Callable[..., Any]] = {}
         self.handlers_by_queue: dict[str, dict[str, Callable[..., Any]]] = {}
         self._events: dict[str, list[Callable[[], None]]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -98,14 +104,14 @@ class Worker:  # pylint: disable=too-many-instance-attributes
             Callable[[Callable[[], None]], None]: _description_
         """
 
+        queue_name = queue_name or "default"
+
         def decorator(func: Callable[[], Any]) -> None:
-            if queue_name:
-                if queue_name not in self.handlers_by_queue:
-                    self.handlers_by_queue[queue_name] = {name: func}
-                else:
-                    self.handlers_by_queue[queue_name][name] = func
+            queue_ = queue_name or "default"
+            if queue_ not in self.handlers_by_queue:
+                self.handlers_by_queue[queue_] = {name: func}
             else:
-                self.handlers[name] = func
+                self.handlers_by_queue[queue_][name] = func
 
         return decorator
 
@@ -161,17 +167,7 @@ class Worker:  # pylint: disable=too-many-instance-attributes
 
         for event in self._events.get("startup", []):
             self._loop.run_until_complete(event())  # type: ignore
-
-        for queue_name, queue in self.queues.items():
-            polling_daemon_task = loop.create_task(
-                queue.start_polling(
-                    self._consumer_callback,
-                    queue_name,
-                    max_parallel_messages=self._max_workers,
-                )
-            )
-            self._tasks = [*self._tasks, polling_daemon_task]
-
+        loop.create_task(self._poll_messages())
         self._loop.run_forever()
 
     def _finish_message(
@@ -224,17 +220,15 @@ class Worker:  # pylint: disable=too-many-instance-attributes
     ) -> bool:
         task_id = task_id or uuid4().hex
         LOGGER.info("Task %s[%s] received", task_name, task_id)
-
+        queue_alias = queue_alias or "default"
         if not self._loop:
             return False
 
         handler = None
-        if queue_alias:
-            if task_name:
-                handler = self.handlers_by_queue.get(queue_alias, {}).get(
-                    task_name
-                )
-                handler = handler or self.handlers.get(task_name)
+        if task_name:
+            handler = self.handlers_by_queue.get(queue_alias, {}).get(
+                task_name
+            )
         if not handler:
             LOGGER.warning(
                 "The task %s has not a candidate to be proceeded",
@@ -299,3 +293,28 @@ class Worker:  # pylint: disable=too-many-instance-attributes
                 await self.queues[queue_alias].delete_messages(
                     message["ReceiptHandle"]
                 )
+
+    async def _poll_messages(self) -> None:
+        queues = list(sorted(self.queues.items(), key=lambda x: x[1].priority))
+        async with SESSION.client(**RESOURCE_OPTIONS_SQS) as sqs_client:
+            while True:
+                if len(
+                    [
+                        task
+                        for task in asyncio.all_tasks(asyncio.get_event_loop())
+                        if task.get_name().startswith(TASK_NAME_PREFIX)
+                    ]
+                ) > (self._max_workers):
+                    await sleep(1)  # type: ignore
+                    continue
+
+                for queue_alias, queue in queues:
+                    messages = await queue.get_messages(sqs_client)
+                    await asyncio.gather(
+                        *[
+                            self._consumer_callback(message, queue_alias)
+                            for message in messages
+                        ]
+                    )
+                    if messages:
+                        break

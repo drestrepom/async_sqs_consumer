@@ -53,12 +53,14 @@ async def get_queue_messages(
     credentials: Optional[AwsCredentials] = None,
     client: Optional[BaseClient] = None,
     visibility_timeout: Optional[int] = None,
+    wait_time_seconds: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     client = await get_sqs_client(credentials)
     response = await client.receive_message(
         QueueUrl=queue_url,
         MaxNumberOfMessages=10,
         VisibilityTimeout=visibility_timeout or 60,
+        WaitTimeSeconds=wait_time_seconds or 0,
     )
     return response.get("Messages", [])
 
@@ -80,17 +82,29 @@ class Queue:
     def __init__(  # pytlint: disable=too-many-arguments,too-many-arguments
         self,
         url: str,
+        priority: Optional[int] = None,
         authentication: Optional[AwsCredentials] = None,
         polling_interval: Optional[float] = None,
         visibility_timeout: Optional[int] = None,
         max_queue_parallel_messages: Optional[int] = None,
     ) -> None:
         self.url = url
+        self.priority = priority or 1
         self.authentication = authentication
         self.polling_interval = polling_interval or 1.0
         self.visibility_timeout = visibility_timeout or 60
         self._max_queue_parallel_messages = max_queue_parallel_messages
         self._polling = False
+
+    async def get_messages(self, sqs_client: Any) -> list[dict[str, Any]]:
+        with suppress(asyncio.CancelledError):
+            messages = await get_queue_messages(
+                self.url,
+                client=sqs_client,
+                visibility_timeout=self.visibility_timeout,
+            )
+            return messages
+        return []
 
     async def start_polling(
         self,
