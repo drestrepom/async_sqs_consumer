@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "async_sqs_consumer"
-version = "1.0.0"
+version = "1.0.2"
 description = ""
 authors = ["Diego Restrepo <drestrepo@fluidattacks.com>"]
 repository = 'https://github.com/drestrepom/async_sqs_consumer'
@@ -9,11 +9,11 @@ keywords = ["AWS", "AWS", "SQS", "sqs", "consumer", "async", "worker"]
 
 [tool.poetry.dependencies]
 python = "^3.9"
-aiobotocore = "^2.4.0"
-aioboto3 = "^12.1.0"
+aioboto3 = "^13.0.0"
+aiobotocore = "^2.0.0"
 jsonschema = "^4.17.3"
 pyrate-limiter = "^2.10.0"
-aiohttp = "^3.8.4"
+aiohttp = "^3.9.2"
 pytz = "^2023.3"
 
 [tool.poetry.dev-dependencies]
