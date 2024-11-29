@@ -1,16 +1,15 @@
+from .types import (
+    AwsCredentials,
+)
 import aioboto3
 from aiobotocore.config import (
     AioConfig,
-)
-from async_sqs_consumer.types import (
-    AwsCredentials,
 )
 from contextlib import (
     AsyncExitStack,
 )
 from typing import (
     Any,
-    Optional,
 )
 
 RESOURCE_OPTIONS_SQS = {
@@ -44,7 +43,7 @@ CONTEXT_STACK_SQS = None
 RESOURCE_SQS = None
 
 
-async def sqs_startup(credentials: Optional[AwsCredentials] = None) -> None:
+async def sqs_startup(credentials: AwsCredentials | None = None) -> None:
     # pylint: disable=global-statement
     global CONTEXT_STACK_SQS, RESOURCE_SQS
 
@@ -66,7 +65,7 @@ async def sqs_shutdown() -> None:
         await CONTEXT_STACK_SQS.aclose()
 
 
-async def get_sqs_client(credentials: Optional[AwsCredentials] = None) -> Any:
+async def get_sqs_client(credentials: AwsCredentials | None = None) -> Any:
     if RESOURCE_SQS is None:
         await sqs_startup(credentials)
 

@@ -1,15 +1,19 @@
-from async_sqs_consumer.queue import (
+from .queue import (
     Queue,
 )
-from async_sqs_consumer.resources import (
+from .resources import (
     RESOURCE_OPTIONS_SQS,
     SESSION,
 )
-from async_sqs_consumer.utils import (
+from .types import (
+    MessageType,
+)
+from .utils import (
+    inverse_proportional_distribution,
     TASK_NAME_PREFIX,
     validate_message,
 )
-from async_sqs_consumer.utils.retry import (
+from .utils.retry import (
     retry_call,
 )
 import asyncio
@@ -18,24 +22,20 @@ from contextlib import (
 )
 from datetime import (
     datetime,
+    timezone,
 )
 from functools import (
     partial,
 )
 import json
 import logging
-import pytz
+import math
 import signal
 import sys
-from time import (
-    sleep,
-)
 from typing import (
     Any,
     Callable,
-    Iterable,
     Literal,
-    Optional,
 )
 from uuid import (
     uuid4,
@@ -46,19 +46,21 @@ logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 
 
-class Worker:  # pylint: disable=too-many-instance-attributes
+class Worker:
     def __init__(
-        self, queues: dict[str, Queue], max_workers: Optional[int] = None
+        self, queues: dict[str, Queue], max_workers: int | None = None
     ) -> None:
         self.queues = queues
         self.running = False
-        self.handlers_by_queue: dict[str, dict[str, Callable[..., Any]]] = {}
+        self.handlers_by_queue: dict[
+            str, dict[str, Callable[..., object]]
+        ] = {}
         self._events: dict[str, list[Callable[[], None]]] = {}
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._tasks: list[asyncio.Task] = []
         self._max_workers = max_workers or 1024
 
-    def _sigint_handler(self, *_args: Any) -> None:
+    def _sigint_handler(self, *_args: object) -> None:
         sys.stdout.write("\b\b\r")
         sys.stdout.flush()
         logging.getLogger("system").warning(
@@ -66,13 +68,13 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         )
         self._stop_worker()
 
-    def _sigterm_handler(self, *_args: Any) -> None:
+    def _sigterm_handler(self, *_args: object) -> None:
         logging.getLogger("system").warning(
             "Received termination signal [SIGTERM]"
         )
         self._stop_worker()
 
-    def _stop_worker(self, *_: Any) -> None:
+    def _stop_worker(self, *_: object) -> None:
         if self._loop:
             LOGGER.debug("Stop worker")
             self.running = False
@@ -83,17 +85,12 @@ class Worker:  # pylint: disable=too-many-instance-attributes
 
             map(lambda task: task.cancel(), self._tasks)
 
-            _queue_tasks = [
-                task
-                for task in asyncio.all_tasks(self._loop)
-                if task.get_name().startswith(TASK_NAME_PREFIX)
-            ]
-            # TODO: make sure all tasks are finished before finishing the
+            # make sure all tasks are finished before finishing the
             # entire process
             self._loop.stop()
 
     def task(
-        self, name: str, queue_name: Optional[str] = None
+        self, name: str, queue_name: str | None = None
     ) -> Callable[..., None]:
         """A decorator to add a task that could be handled by the worker.
 
@@ -106,7 +103,7 @@ class Worker:  # pylint: disable=too-many-instance-attributes
 
         queue_name = queue_name or "default"
 
-        def decorator(func: Callable[[], Any]) -> None:
+        def decorator(func: Callable[[], object]) -> None:
             queue_ = queue_name or "default"
             if queue_ not in self.handlers_by_queue:
                 self.handlers_by_queue[queue_] = {name: func}
@@ -138,12 +135,12 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         return decorator
 
     def start(
-        self, event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self, event_loop: asyncio.AbstractEventLoop | None = None
     ) -> None:
         """Start the workert
 
         Args:
-            event_loop (Optional[asyncio.AbstractEventLoop], optional):
+            event_loop (asyncio.AbstractEventLoop  | None, optional):
             if an eventloop is already running you can run the worker in it.
             Defaults to None.
         """
@@ -172,20 +169,24 @@ class Worker:  # pylint: disable=too-many-instance-attributes
 
     def _finish_message(
         self,
-        _future: Optional[asyncio.Future],
+        _future: asyncio.Future | None,
         *,
         handler_name: str,
         task_id: str,
         queue_alias: str,
         start_time: float,
-        receipt_handle: Optional[Any] = None,
+        receipt_handle: object | None = None,
     ) -> None:
-        start_date = datetime.fromtimestamp(start_time, pytz.UTC)
-        end_date = datetime.utcnow().replace(tzinfo=pytz.UTC)
+        start_date = datetime.fromtimestamp(start_time, tz=timezone.utc)
+        end_date = datetime.now(tz=timezone.utc)
         total_seconds = end_date - start_date
         if _future and _future.exception() is not None:
             LOGGER.warning(
                 "Failed to execute task %s[%s]", handler_name, task_id
+            )
+            LOGGER.exception(
+                "Following exception",
+                exc_info=_future.exception(),
             )
         else:
             LOGGER.info(
@@ -199,36 +200,49 @@ class Worker:  # pylint: disable=too-many-instance-attributes
 
     def _delete_message(
         self,
-        receipt_handle: Any,
+        receipt_handle: object,
         queue_alias: str,
     ) -> None:
         asyncio.ensure_future(
-            self.queues[queue_alias].delete_messages(receipt_handle),
+            self.queues[queue_alias].delete_messages(
+                receipt_handle  # type: ignore[arg-type]
+            ),
             loop=self._loop,
+        )
+
+    def _available_workers_to_consume(self) -> int:
+        current_tasks = [
+            task
+            for task in asyncio.all_tasks(asyncio.get_event_loop())
+            if task.get_name().startswith(TASK_NAME_PREFIX)
+        ]
+        return self._max_workers - len(current_tasks)
+
+    def _get_tasks_by_queue(
+        self, queue_alias: str
+    ) -> tuple[asyncio.Task, ...]:
+        return tuple(
+            task
+            for task in asyncio.all_tasks(asyncio.get_event_loop())
+            if task.get_name().startswith(f"{TASK_NAME_PREFIX}_{queue_alias}")
         )
 
     async def queue_message_to_worker(
         self,
         *,
-        task_id: Optional[str] = None,
-        task_name: Optional[str] = None,
-        queue_alias: Optional[str] = None,
-        retries: Optional[int] = None,
-        receipt_handler: Optional[Any] = None,
-        args: Optional[Iterable[Any]] = None,
-        kwargs: Optional[dict[str, Any]] = None,
+        body: dict[str, Any],
+        message_type: MessageType,
+        queue_alias: str,
+        receipt_handler: str,
     ) -> bool:
-        task_id = task_id or uuid4().hex
+        task_id = body.get("id") or uuid4().hex
+        task_name = body.get("task") or message_type.value.lower()
         LOGGER.info("Task %s[%s] received", task_name, task_id)
-        queue_alias = queue_alias or "default"
+
         if not self._loop:
             return False
 
-        handler = None
-        if task_name:
-            handler = self.handlers_by_queue.get(queue_alias, {}).get(
-                task_name
-            )
+        handler = self.handlers_by_queue.get(queue_alias, {}).get(task_name)
         if not handler:
             LOGGER.warning(
                 "The task %s has not a candidate to be proceeded",
@@ -239,12 +253,16 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         task = self._loop.create_task(
             retry_call(
                 handler,
-                fargs=tuple(args or []),
-                fkwargs=kwargs or {},
-                tries=retries or 1,
+                fargs=tuple(body.get("args", [])),
+                fkwargs=(
+                    body
+                    if message_type == MessageType.SNS_NOTIFICATION
+                    else body.get("kwargs", {})
+                ),
+                tries=body.get("retries", 1),
             ),
             name=(
-                f"{TASK_NAME_PREFIX}{queue_alias}"
+                f"{TASK_NAME_PREFIX}_{queue_alias}"
                 f"_{task_name}_{uuid4().hex[:8]}"
             ),
         )
@@ -253,7 +271,7 @@ class Worker:  # pylint: disable=too-many-instance-attributes
                 self._finish_message,
                 receipt_handle=receipt_handler,
                 queue_alias=queue_alias,
-                start_time=datetime.utcnow().timestamp(),
+                start_time=datetime.now().timestamp(),
                 handler_name=task_name,
                 task_id=task_id,
             )
@@ -268,18 +286,20 @@ class Worker:  # pylint: disable=too-many-instance-attributes
         except json.JSONDecodeError:
             return False
 
-        if not validate_message(body):
+        message_type = (
+            MessageType.SNS_NOTIFICATION
+            if body.get("Type") == "Notification"
+            else MessageType.CUSTOM
+        )
+        if not validate_message(body, message_type):
             LOGGER.error("Failed to validate message")
             return False
 
         await self.queue_message_to_worker(
-            task_id=body["id"],
-            task_name=body["task"],
+            body=body,
+            message_type=message_type,
             queue_alias=queue_alias,
-            retries=body.get("retries", 1),
             receipt_handler=message_content["ReceiptHandle"],
-            args=body.get("args", []),
-            kwargs=body.get("kwargs", {}),
         )
 
         return True
@@ -294,27 +314,64 @@ class Worker:  # pylint: disable=too-many-instance-attributes
                     message["ReceiptHandle"]
                 )
 
+    async def _queue_n_messages(
+        self,
+        *,
+        queue: Queue,
+        queue_alias: str,
+        sqs_client: object,
+        required_messages: int,
+    ) -> None:
+        for _ in range(math.ceil(required_messages / 10)):
+            messages = await queue.get_messages(
+                sqs_client,
+                max_number_of_messages=(required_messages),
+            )
+
+            if len(messages) == 0:
+                break
+
+            await asyncio.gather(
+                *[
+                    self._consumer_callback(message, queue_alias)
+                    for message in messages
+                ]
+            )
+
     async def _poll_messages(self) -> None:
         queues = list(sorted(self.queues.items(), key=lambda x: x[1].priority))
+        queues = [item for item in queues if item[1].enabled]
         async with SESSION.client(**RESOURCE_OPTIONS_SQS) as sqs_client:
             while True:
-                if len(
-                    [
-                        task
-                        for task in asyncio.all_tasks(asyncio.get_event_loop())
-                        if task.get_name().startswith(TASK_NAME_PREFIX)
-                    ]
-                ) > (self._max_workers):
+                if self._available_workers_to_consume() < 1:
                     await asyncio.sleep(1)
                     continue
-
-                for queue_alias, queue in queues:
-                    messages = await queue.get_messages(sqs_client)
-                    await asyncio.gather(
-                        *[
-                            self._consumer_callback(message, queue_alias)
-                            for message in messages
-                        ]
+                for index, (queue_alias, queue) in enumerate(queues):
+                    required_messages = math.ceil(
+                        inverse_proportional_distribution(
+                            self._available_workers_to_consume(),
+                            [q[1].priority for q in queues[index:]],
+                        )[0]
                     )
-                    if messages:
-                        break
+
+                    # it is necessary to request the messages several times
+                    # because sqs only allows to obtain 10 messages at the
+                    # same time
+                    await self._queue_n_messages(
+                        queue=queue,
+                        queue_alias=queue_alias,
+                        sqs_client=sqs_client,
+                        required_messages=required_messages,
+                    )
+
+                    LOGGER.info(
+                        "Queue messages info",
+                        extra={
+                            "extra": {
+                                "queue": queue,
+                                "queue_alias": queue_alias,
+                                "sqs_client": sqs_client,
+                                "required_messages": required_messages,
+                            }
+                        },
+                    )
