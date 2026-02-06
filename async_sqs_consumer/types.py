@@ -42,8 +42,8 @@ class AwsCredentials(NamedTuple):
 
 
 class MessageType(Enum):
-    CUSTOM: str = "CUSTOM"
-    SNS_NOTIFICATION: str = "SNS_NOTIFICATION"
+    CUSTOM = "CUSTOM"
+    SNS_NOTIFICATION = "SNS_NOTIFICATION"
 
 
 class SqsOptions(NamedTuple):

@@ -1,8 +1,8 @@
 from .types import (
     AwsCredentials,
 )
-import aioboto3
-from aiobotocore.config import (
+import aioboto3  # type: ignore[import-untyped]
+from aiobotocore.config import (  # type: ignore[import-untyped]
     AioConfig,
 )
 from contextlib import (

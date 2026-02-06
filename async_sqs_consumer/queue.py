@@ -23,8 +23,8 @@ from asyncio import (
     get_event_loop,
     sleep,
 )
-from botocore.client import (
-    BaseClient,
+from mypy_boto3_sqs.client import (
+    SQSClient,
 )
 from botocore.exceptions import (
     ClientError,
@@ -67,7 +67,7 @@ async def get_queue_messages(
     *,
     queue_url: str,
     credentials: AwsCredentials | None = None,
-    client: BaseClient | None = None,
+    client: SQSClient | None = None,
     visibility_timeout: int | None = None,
     wait_time_seconds: int | None = None,
     max_number_of_messages: int | None = None,
@@ -75,7 +75,7 @@ async def get_queue_messages(
     client = client or await get_sqs_client(credentials)
     max_number_of_messages = set_max_number_of_messages(max_number_of_messages)
     try:
-        response = await client.receive_message(
+        response = await client.receive_message(  # type: ignore[misc]
             QueueUrl=queue_url,
             MaxNumberOfMessages=max_number_of_messages,
             VisibilityTimeout=visibility_timeout or 60,
